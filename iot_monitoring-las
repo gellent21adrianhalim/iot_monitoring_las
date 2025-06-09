@@ -1,0 +1,139 @@
+
+#include <ESP8266WiFi.h>
+#include <WebSocketsClient.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_ADXL345_U.h>
+#include <Adafruit_HMC5883_U.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <ArduinoJson.h>
+
+// WiFi config
+const char* ssid = "FTI-USAKTI";
+const char* password = "trisakti2022";
+
+// WebSocket config
+WebSocketsClient webSocket;
+
+// NTP Client
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600, 60000); // GMT+7
+
+// Sensor instances
+Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);
+Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(54321);
+
+// Gyro ITG3205 address
+#define ITG3205_ADDR 0x68
+
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      Serial.println("WebSocket Connected!");
+      break;
+    case WStype_DISCONNECTED:
+      Serial.println("WebSocket Disconnected");
+      break;
+    case WStype_TEXT:
+      Serial.printf("Received: %s\n", payload);
+      break;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  // Connect WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+
+  // Start NTP
+  timeClient.begin();
+
+  // Start sensors
+  if (!accel.begin()) {
+    Serial.println("ADXL345 not found");
+    while (1);
+  }
+  if (!mag.begin()) {
+    Serial.println("HMC5883L not found");
+    while (1);
+  }
+
+  // Init ITG3205
+  Wire.beginTransmission(ITG3205_ADDR);
+  Wire.write(0x3E); // Power management
+  Wire.write(0x00);
+  Wire.endTransmission();
+
+  // Connect WebSocket ke Django
+  webSocket.begin("10.24.80.103", 8000, "/ws/data/");
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
+}
+
+int16_t readWord(uint8_t reg) {
+  Wire.beginTransmission(ITG3205_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(ITG3205_ADDR, 2);
+  int16_t val = Wire.read() << 8 | Wire.read();
+  return val;
+}
+
+void loop() {
+  webSocket.loop();
+  timeClient.update();
+
+  static unsigned long lastSend = 0;
+  if (millis() - lastSend > 1000) {
+    lastSend = millis();
+
+    sensors_event_t event;
+    sensors_event_t magEvent;
+
+    // Read Accelerometer
+    accel.getEvent(&event);
+
+    // Read Magnetometer
+    mag.getEvent(&magEvent);
+
+    // Read Gyro
+    int16_t gx = readWord(0x1D);
+    int16_t gy = readWord(0x1F);
+    int16_t gz = readWord(0x21);
+
+    // Compose timestamp string (format: YYYY-MM-DDTHH:MM:SS.mmm)
+    unsigned long epochTime = timeClient.getEpochTime();
+    unsigned long msPart = millis() % 1000;
+    struct tm *ptm = gmtime((time_t *)&epochTime);
+    char timeStamp[30];
+    sprintf(timeStamp, "%04d-%02d-%02dT%02d:%02d:%02d.%03lu",
+      ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday,
+      ptm->tm_hour, ptm->tm_min, ptm->tm_sec, msPart);
+
+    // Prepare JSON
+    StaticJsonDocument<512> doc;
+    doc["gx"] = gx;
+    doc["gy"] = gy;
+    doc["gz"] = gz;
+    doc["ax"] = event.acceleration.x;
+    doc["ay"] = event.acceleration.y;
+    doc["az"] = event.acceleration.z;
+    doc["mx"] = magEvent.magnetic.x;
+    doc["my"] = magEvent.magnetic.y;
+    doc["mz"] = magEvent.magnetic.z;
+    doc["timestamp"] = timeStamp;
+
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    webSocket.sendTXT(jsonStr);
+    Serial.println("Kirim: " + jsonStr);
+  }
+}
