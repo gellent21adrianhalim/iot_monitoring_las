@@ -1,6 +1,6 @@
-
+// Include library untuk koneksi WiFi, MQTT, I2C, sensor, NTP time, dan JSON
 #include <ESP8266WiFi.h>
-#include <WebSocketsClient.h>
+#include <PubSubClient.h>
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_ADXL345_U.h>
@@ -9,131 +9,193 @@
 #include <WiFiUdp.h>
 #include <ArduinoJson.h>
 
-// WiFi config
-const char* ssid = "FTI-USAKTI";
-const char* password = "trisakti2022";
+// Konfigurasi WiFi
+const char* ssid = "@WIFI - USAKTI Out";  // SSID WiFi yang akan digunakan
+const char* password = "";                // Password WiFi (kosong kalau open)
 
-// WebSocket config
-WebSocketsClient webSocket;
+// Konfigurasi MQTT broker
+const char* mqtt_server = "10.24.48.37";  // IP address MQTT broker
+const int mqtt_port = 1883;               // Port MQTT
+const char* mqtt_topic = "sensor/data";   // Topik MQTT untuk publish data
 
-// NTP Client
+// Objek WiFi client dan MQTT client
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// NTP Client untuk sinkronisasi waktu via internet
 WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600, 60000); // GMT+7
+NTPClient timeClient(ntpUDP, "216.239.35.0", 7 * 3600, 60000); // Server NTP, offset GMT+7, update tiap 60 detik
+bool hasValidTime = false;  // Status apakah waktu valid
 
-// Sensor instances
+// Inisialisasi objek sensor ADXL345 (accelerometer) dan HMC5883L (magnetometer)
 Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);
 Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(54321);
 
-// Gyro ITG3205 address
+// Alamat I2C untuk sensor gyroscope ITG3205
 #define ITG3205_ADDR 0x68
 
-void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
-  switch (type) {
-    case WStype_CONNECTED:
-      Serial.println("WebSocket Connected!");
-      break;
-    case WStype_DISCONNECTED:
-      Serial.println("WebSocket Disconnected");
-      break;
-    case WStype_TEXT:
-      Serial.printf("Received: %s\n", payload);
-      break;
+// Fungsi untuk reconnect MQTT saat koneksi terputus
+void reconnectMQTT() {
+  while (!client.connected()) {   // Cek koneksi MQTT
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect("ESP8266Client")) {  // Coba konek
+      Serial.println("connected.");
+    } else {
+      // Gagal konek, tampilkan error code dan retry setelah 5 detik
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+// Fungsi untuk membaca 2-byte data dari alamat register ITG3205
+int16_t readWord(uint8_t reg) {
+  Wire.beginTransmission(ITG3205_ADDR);
+  Wire.write(reg);                      // Kirim alamat register
+  Wire.endTransmission(false);
+  if (Wire.requestFrom(ITG3205_ADDR, 2) == 2) {   // Minta 2 byte data
+    int16_t val = Wire.read() << 8 | Wire.read(); // Gabungkan jadi 16-bit integer
+    return val;
+  } else {
+    Serial.println("Failed to read gyro data.");
+    return 0;
   }
 }
 
 void setup() {
-  Serial.begin(115200);
-  Wire.begin();
+  Serial.begin(115200);  // Mulai Serial Monitor di baudrate 115200
 
-  // Connect WiFi
+  // Inisialisasi I2C di pin D2 (SDA = GPIO4), D1 (SCL = GPIO5)
+  Wire.begin(4, 5);
+
+  // Koneksi WiFi
+  Serial.println("Connecting to WiFi...");
   WiFi.begin(ssid, password);
+  unsigned long wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
+    // Jika gagal konek dalam 15 detik, restart ESP
+    if (millis() - wifiStart > 15000) {
+      Serial.println("\nFailed to connect to WiFi.");
+      ESP.restart();
+    }
   }
-  Serial.println("\nWiFi connected");
+  Serial.println("\nWiFi connected.");
+  Serial.print("IP Address: "); Serial.println(WiFi.localIP());
+  Serial.print("DNS: "); Serial.println(WiFi.dnsIP());
 
-  // Start NTP
+  // Mulai NTP Client untuk sinkronisasi waktu
   timeClient.begin();
+  delay(1000);
+  Serial.println("Force syncing time...");
+  hasValidTime = timeClient.forceUpdate();  // Paksa sync di awal
+  if (!hasValidTime) Serial.println("Initial NTP sync failed!");
 
-  // Start sensors
+  // Inisialisasi sensor accelerometer ADXL345
   if (!accel.begin()) {
-    Serial.println("ADXL345 not found");
-    while (1);
+    Serial.println("Error: ADXL345 not detected. Check wiring.");
+    while (1);  // Berhenti di sini kalau gagal
   }
+  Serial.println("ADXL345 detected.");
+
+  // Inisialisasi sensor magnetometer HMC5883L
   if (!mag.begin()) {
-    Serial.println("HMC5883L not found");
+    Serial.println("Error: HMC5883L not detected. Check wiring.");
     while (1);
   }
+  Serial.println("HMC5883L detected.");
 
-  // Init ITG3205
+  // Inisialisasi gyroscope ITG3205 (bangunkan sensor)
   Wire.beginTransmission(ITG3205_ADDR);
-  Wire.write(0x3E); // Power management
-  Wire.write(0x00);
+  Wire.write(0x3E);  // Register power management
+  Wire.write(0x00);  // Set normal mode
   Wire.endTransmission();
+  Serial.println("ITG3205 initialized.");
 
-  // Connect WebSocket ke Django
-  webSocket.begin("10.24.80.103", 8000, "/ws/data/");
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(5000);
-}
-
-int16_t readWord(uint8_t reg) {
-  Wire.beginTransmission(ITG3205_ADDR);
-  Wire.write(reg);
-  Wire.endTransmission(false);
-  Wire.requestFrom(ITG3205_ADDR, 2);
-  int16_t val = Wire.read() << 8 | Wire.read();
-  return val;
+  // Konfigurasi alamat server MQTT
+  client.setServer(mqtt_server, mqtt_port);
 }
 
 void loop() {
-  webSocket.loop();
-  timeClient.update();
+  // Pastikan MQTT terkoneksi
+  if (!client.connected()) reconnectMQTT();
+  client.loop();  // Proses MQTT internal
 
-  static unsigned long lastSend = 0;
-  if (millis() - lastSend > 1000) {
-    lastSend = millis();
+  static unsigned long lastSend = 0;         // Waktu pengiriman terakhir
+  unsigned long currentMillis = millis();    // Waktu saat ini
 
-    sensors_event_t event;
-    sensors_event_t magEvent;
+  // Jika sudah 1 detik berlalu, kirim data
+  if (currentMillis - lastSend >= 1000) {
+    lastSend = currentMillis;
 
-    // Read Accelerometer
-    accel.getEvent(&event);
+    // Cek status WiFi, reconnect jika terputus
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi lost. Reconnecting...");
+      WiFi.begin(ssid, password);
+      return;
+    }
 
-    // Read Magnetometer
+    // Update waktu dari NTP
+    if (timeClient.update()) hasValidTime = true;
+    if (!hasValidTime) {
+      Serial.println("Waiting for NTP time...");
+      return;
+    }
+
+    // Ambil epoch time (detik sejak 1970)
+    unsigned long epochTime = timeClient.getEpochTime();
+    // Cek validitas epoch (harus > tahun 2020)
+    if (epochTime < 1577836800) {
+      Serial.printf("Invalid epoch: %lu\n", epochTime);
+      return;
+    }
+
+    // Konversi epoch ke struct waktu lokal
+    time_t rawTime = epochTime;
+    struct tm timeinfo;
+    localtime_r(&rawTime, &timeinfo);
+
+    // Baca data sensor accelerometer dan magnetometer
+    sensors_event_t accelEvent, magEvent;
+    accel.getEvent(&accelEvent);
     mag.getEvent(&magEvent);
 
-    // Read Gyro
+    // Baca data gyro sumbu X, Y, Z
     int16_t gx = readWord(0x1D);
     int16_t gy = readWord(0x1F);
     int16_t gz = readWord(0x21);
 
-    // Compose timestamp string (format: YYYY-MM-DDTHH:MM:SS.mmm)
-    unsigned long epochTime = timeClient.getEpochTime();
-    unsigned long msPart = millis() % 1000;
-    struct tm *ptm = gmtime((time_t *)&epochTime);
+    // Ambil nilai millisecond (0-999)
+    unsigned long msPart = currentMillis % 1000;
+    // Format string timestamp lengkap yyyy-MM-ddTHH:mm:ss.mmm
     char timeStamp[30];
     sprintf(timeStamp, "%04d-%02d-%02dT%02d:%02d:%02d.%03lu",
-      ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday,
-      ptm->tm_hour, ptm->tm_min, ptm->tm_sec, msPart);
+            timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+            timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, msPart);
 
-    // Prepare JSON
+    // Buat dokumen JSON untuk dikirim via MQTT
     StaticJsonDocument<512> doc;
+    doc["ax"] = accelEvent.acceleration.x;
+    doc["ay"] = accelEvent.acceleration.y;
+    doc["az"] = accelEvent.acceleration.z;
     doc["gx"] = gx;
     doc["gy"] = gy;
     doc["gz"] = gz;
-    doc["ax"] = event.acceleration.x;
-    doc["ay"] = event.acceleration.y;
-    doc["az"] = event.acceleration.z;
     doc["mx"] = magEvent.magnetic.x;
     doc["my"] = magEvent.magnetic.y;
     doc["mz"] = magEvent.magnetic.z;
     doc["timestamp"] = timeStamp;
 
+    // Serialize JSON ke string
     String jsonStr;
     serializeJson(doc, jsonStr);
-    webSocket.sendTXT(jsonStr);
-    Serial.println("Kirim: " + jsonStr);
+    // Publish data JSON ke topik MQTT
+    client.publish(mqtt_topic, jsonStr.c_str());
+
+    // Tampilkan data JSON ke Serial Monitor
+    Serial.println("Sent: " + jsonStr);
   }
 }
