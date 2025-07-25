@@ -1,0 +1,244 @@
+#include <ESP8266WiFi.h>                      // Library untuk koneksi WiFi
+#include <WebSocketsServer.h>                // Library WebSocket Server (untuk browser)
+#include <WebSocketsClient.h>                // Library WebSocket Client (untuk Django)
+#include <ESP8266WebServer.h>                // Web server untuk melayani halaman HTML
+#include <Wire.h>                            // I2C communication
+#include <Adafruit_Sensor.h>                 // Base class untuk sensor Adafruit
+#include <Adafruit_ADXL345_U.h>              // Library untuk sensor ADXL345
+#include <Adafruit_HMC5883_U.h>              // Library untuk sensor HMC5883L
+#include <NTPClient.h>                       // Untuk sinkronisasi waktu via NTP
+#include <WiFiUdp.h>                         // UDP diperlukan oleh NTPClient
+#include <ArduinoJson.h>                     // Library JSON untuk kirim data sensor
+
+// Konfigurasi WiFi
+const char* ssid = "@WIFI - USAKTI Out";      // Nama SSID WiFi
+const char* password = "";                   // Password WiFi
+
+// WebSocket client untuk koneksi ke Django
+WebSocketsClient wsClient;
+const char* ws_host = "10.24.48.19";          // IP server Django
+const uint16_t ws_port = 8000;                // Port WebSocket di server Django
+const char* ws_path = "/ws/data/";           // Endpoint WebSocket
+
+// Web server & WebSocket server lokal (untuk browser)
+ESP8266WebServer server(80);                  // HTTP server port 80
+WebSocketsServer wsServer = WebSocketsServer(81); // WebSocket server port 81
+
+// Inisialisasi NTP
+WiFiUDP ntpUDP;                               // Objek UDP
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600, 60000); // UTC+7, update setiap 60 detik
+
+// Inisialisasi sensor
+Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345); // Sensor akselerometer
+Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(54321);   // Sensor magnetometer
+#define ITG3205_ADDR 0x68                     // Alamat I2C sensor gyro ITG3205
+
+// Halaman web yang ditampilkan ke browser (HTML + Chart.js)
+const char htmlPage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Welding Monitoring Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: sans-serif; background: #f0f0f0; padding: 20px; text-align: center; }
+    canvas { background: #fff; border: 1px solid #ccc; margin-top: 10px; }
+    #output { background: #fff; border: 1px solid #ccc; margin: 20px 0; padding: 10px; text-align: left; max-height: 250px; overflow-y: auto; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <h1>Realtime Welding Monitoring via WebSocket</h1>
+  <div id="output"></div>
+
+  <h2>Accelerometer (m/s²)</h2>
+  <canvas id="accelChart" width="800" height="300"></canvas>
+
+  <h2>Gyroscope (raw)</h2>
+  <canvas id="gyroChart" width="800" height="300"></canvas>
+
+  <h2>Magnetometer (uT)</h2>
+  <canvas id="magChart" width="800" height="300"></canvas>
+
+  <script>
+    let socket = new WebSocket(`ws://${location.hostname}:81`);  // Koneksi WebSocket ke ESP
+    const output = document.getElementById("output");
+    const maxPoints = 20;
+    const labels = [];
+
+    function createChart(ctx, label, colors) {
+      return new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: label.map((l, i) => ({
+            label: l,
+            borderColor: colors[i],
+            data: [],
+            fill: false,
+          }))
+        },
+        options: {
+          responsive: true,
+          animation: false,
+          scales: {
+            x: { display: true },
+            y: { display: true }
+          }
+        }
+      });
+    }
+
+    const accelChart = createChart(
+      document.getElementById('accelChart').getContext('2d'),
+      ['ax', 'ay', 'az'],
+      ['red', 'green', 'blue']
+    );
+
+    const gyroChart = createChart(
+      document.getElementById('gyroChart').getContext('2d'),
+      ['gx', 'gy', 'gz'],
+      ['orange', 'purple', 'brown']
+    );
+
+    const magChart = createChart(
+      document.getElementById('magChart').getContext('2d'),
+      ['mx', 'my', 'mz'],
+      ['teal', 'olive', 'maroon']
+    );
+
+    socket.onmessage = function(e) {
+      const data = JSON.parse(e.data);  // Terima dan parse JSON dari ESP
+      const timeLabel = new Date().toLocaleTimeString();
+
+      labels.push(timeLabel);
+      if (labels.length > maxPoints) labels.shift();
+
+      [accelChart, gyroChart, magChart].forEach(chart => {
+        chart.data.datasets.forEach(ds => {
+          if (ds.data.length >= maxPoints) ds.data.shift();
+        });
+      });
+
+      accelChart.data.datasets[0].data.push(data.ax);
+      accelChart.data.datasets[1].data.push(data.ay);
+      accelChart.data.datasets[2].data.push(data.az);
+
+      gyroChart.data.datasets[0].data.push(data.gx);
+      gyroChart.data.datasets[1].data.push(data.gy);
+      gyroChart.data.datasets[2].data.push(data.gz);
+
+      magChart.data.datasets[0].data.push(data.mx);
+      magChart.data.datasets[1].data.push(data.my);
+      magChart.data.datasets[2].data.push(data.mz);
+
+      accelChart.update();
+      gyroChart.update();
+      magChart.update();
+
+      const logLine = `[${timeLabel}] ${JSON.stringify(data)}\n`;
+      output.textContent += logLine;
+      output.scrollTop = output.scrollHeight;
+    };
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// Fungsi untuk membaca data 16-bit dari ITG-3205
+int16_t readWord(uint8_t reg) {
+  Wire.beginTransmission(ITG3205_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  if (Wire.requestFrom(ITG3205_ADDR, 2) == 2)
+    return Wire.read() << 8 | Wire.read();
+  return 0;
+}
+
+void setup() {
+  Serial.begin(115200);                   // Mulai serial monitor
+  Wire.begin(4, 5);                       // Inisialisasi I2C SDA=D2 (GPIO4), SCL=D1 (GPIO5)
+
+  WiFi.begin(ssid, password);            // Hubungkan ke WiFi
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print(".");       // Tampilkan progress koneksi
+  }
+
+  Serial.println();
+  Serial.print("✅ WiFi connected! Access dashboard at: http://");
+  Serial.println(WiFi.localIP());        // Tampilkan IP lokal
+
+  timeClient.begin();                    // Mulai sinkronisasi waktu
+  timeClient.forceUpdate();              // Ambil waktu awal langsung
+
+  wsClient.begin(ws_host, ws_port, ws_path); // Koneksi WebSocket ke Django
+  wsClient.onEvent([](WStype_t type, uint8_t* payload, size_t len) {
+    if (type == WStype_CONNECTED) Serial.println("[WebSocket] Connected to Django");
+    if (type == WStype_DISCONNECTED) Serial.println("[WebSocket] Disconnected from Django");
+  });
+
+  wsServer.begin();                      // Mulai WebSocket server lokal (browser)
+
+  server.on("/", HTTP_GET, []() {         // Saat ada akses ke root URL
+    server.send_P(200, "text/html", htmlPage); // Kirim halaman HTML
+  });
+  server.begin();                        // Mulai HTTP server
+
+  if (!accel.begin() || !mag.begin()) {  // Cek sensor
+    Serial.println("Sensor not detected");
+    while (1);
+  }
+
+  Wire.beginTransmission(ITG3205_ADDR);  // Aktifkan ITG-3205 dari sleep
+  Wire.write(0x3E);
+  Wire.write(0x00);
+  Wire.endTransmission();
+}
+
+void loop() {
+  wsClient.loop();                       // Loop untuk WebSocket client
+  wsServer.loop();                       // Loop untuk WebSocket server
+  server.handleClient();                 // Handle permintaan HTTP
+
+  static unsigned long lastSend = 0;
+  if (millis() - lastSend > 500) {       // Kirim data setiap 500ms
+    lastSend = millis();
+    timeClient.update();
+    unsigned long epochTime = timeClient.getEpochTime();
+
+    sensors_event_t a, m;
+    accel.getEvent(&a);                  // Baca akselerometer
+    mag.getEvent(&m);                    // Baca magnetometer
+
+    int16_t gx = readWord(0x1D);         // Baca data gyro X
+    int16_t gy = readWord(0x1F);         // Baca data gyro Y
+    int16_t gz = readWord(0x21);         // Baca data gyro Z
+
+    char timeStamp[30];
+    time_t rawTime = epochTime;
+    struct tm timeinfo;
+    localtime_r(&rawTime, &timeinfo);    // Konversi ke waktu lokal
+    sprintf(timeStamp, "%04d-%02d-%02dT%02d:%02d:%02d",
+      timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+      timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+
+    StaticJsonDocument<512> doc;         // Buat objek JSON
+    doc["ax"] = a.acceleration.x;
+    doc["ay"] = a.acceleration.y;
+    doc["az"] = a.acceleration.z;
+    doc["gx"] = gx;
+    doc["gy"] = gy;
+    doc["gz"] = gz;
+    doc["mx"] = m.magnetic.x;
+    doc["my"] = m.magnetic.y;
+    doc["mz"] = m.magnetic.z;
+    doc["timestamp"] = timeStamp;
+
+    String payload;
+    serializeJson(doc, payload);         // Ubah JSON jadi string
+
+    wsClient.sendTXT(payload);           // Kirim ke Django
+    wsServer.broadcastTXT(payload);      // Kirim ke browser
+    Serial.println(payload);             // Tampilkan ke Serial Monitor
+  }
+}
