@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Welding Monitoring Dashboard (MQTT WebSocket)</title>
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body {
+      font-family: sans-serif;
+      background: #f0f0f0;
+      padding: 20px;
+      text-align: center;
+    }
+    h2 { margin-top: 30px; color: #333; }
+    canvas {
+      background: #fff;
+      border: 1px solid #ccc;
+      margin-top: 10px;
+    }
+    #output {
+      background: #fff;
+      border: 1px solid #ccc;
+      margin: 20px 0;
+      padding: 10px;
+      text-align: left;
+      max-height: 250px;
+      overflow-y: auto;
+      font-size: 14px;
+    }
+    .btn {
+      padding: 10px 20px;
+      margin: 5px;
+      font-size: 16px;
+      cursor: pointer;
+    }
+    #status {
+      margin: 10px 0;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <h1>Realtime Welding Monitoring via MQTT</h1>
+
+  <div id="status">Connecting to broker...</div>
+  <button class="btn" onclick="sendControl('ON')">Start Data</button>
+  <button class="btn" onclick="sendControl('OFF')">Stop Data</button>
+
+  <h2>Realtime Data Output</h2>
+  <div id="output"></div>
+
+  <h2>Accelerometer (m/s²)</h2>
+  <canvas id="accelChart" width="800" height="300"></canvas>
+
+  <h2>Gyroscope (raw)</h2>
+  <canvas id="gyroChart" width="800" height="300"></canvas>
+
+  <h2>Magnetometer (uT)</h2>
+  <canvas id="magChart" width="800" height="300"></canvas>
+
+  <script>
+    const brokerIP = 'ws://10.24.48.16:9001'; // sesuaikan IP broker di sini IPv4 Address. . . . . . . . . . . lokal
+    const client = mqtt.connect(brokerIP);
+
+    const statusDiv = document.getElementById('status');
+
+    const maxPoints = 20;
+    const labels = [];
+
+    function createChart(ctx, label, colors) {
+      return new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: label.map((l, i) => ({
+            label: l,
+            borderColor: colors[i],
+            data: [],
+            fill: false,
+          }))
+        },
+        options: {
+          responsive: true,
+          animation: false,
+          scales: {
+            x: { display: true },
+            y: { display: true }
+          }
+        }
+      });
+    }
+
+    const accelChart = createChart(
+      document.getElementById('accelChart').getContext('2d'),
+      ['ax', 'ay', 'az'],
+      ['red', 'green', 'blue']
+    );
+
+    const gyroChart = createChart(
+      document.getElementById('gyroChart').getContext('2d'),
+      ['gx', 'gy', 'gz'],
+      ['orange', 'purple', 'brown']
+    );
+
+    const magChart = createChart(
+      document.getElementById('magChart').getContext('2d'),
+      ['mx', 'my', 'mz'],
+      ['teal', 'olive', 'maroon']
+    );
+
+    client.on('connect', () => {
+      console.log("Connected to MQTT Broker");
+      statusDiv.textContent = "🟢 Connected to MQTT Broker";
+      client.subscribe('sensor/data');
+    });
+
+    client.on('message', (topic, message) => {
+      const data = JSON.parse(message.toString());
+      const timeLabel = new Date().toLocaleTimeString();
+
+      labels.push(timeLabel);
+      if (labels.length > maxPoints) labels.shift();
+
+      // Accelerometer
+      accelChart.data.datasets[0].data.push(data.ax);
+      accelChart.data.datasets[1].data.push(data.ay);
+      accelChart.data.datasets[2].data.push(data.az);
+      if (accelChart.data.datasets[0].data.length > maxPoints) {
+        accelChart.data.datasets.forEach(ds => ds.data.shift());
+      }
+
+      // Gyroscope
+      gyroChart.data.datasets[0].data.push(data.gx);
+      gyroChart.data.datasets[1].data.push(data.gy);
+      gyroChart.data.datasets[2].data.push(data.gz);
+      if (gyroChart.data.datasets[0].data.length > maxPoints) {
+        gyroChart.data.datasets.forEach(ds => ds.data.shift());
+      }
+
+      // Magnetometer
+      magChart.data.datasets[0].data.push(data.mx);
+      magChart.data.datasets[1].data.push(data.my);
+      magChart.data.datasets[2].data.push(data.mz);
+      if (magChart.data.datasets[0].data.length > maxPoints) {
+        magChart.data.datasets.forEach(ds => ds.data.shift());
+      }
+
+      accelChart.update();
+      gyroChart.update();
+      magChart.update();
+
+      const outputDiv = document.getElementById('output');
+      const logLine = `[${timeLabel}] ${JSON.stringify(data)}\n`;
+      outputDiv.textContent += logLine;
+      outputDiv.scrollTop = outputDiv.scrollHeight;
+    });
+
+    client.on('error', (err) => {
+      console.error("MQTT Error: ", err);
+      statusDiv.textContent = "🔴 MQTT Error, cek koneksi broker!";
+    });
+
+    client.on('offline', () => {
+      statusDiv.textContent = "🔴 MQTT Offline, reconnecting...";
+    });
+
+    function sendControl(cmd) {
+      client.publish('sensor/control', cmd);
+      const logLine = `[${new Date().toLocaleTimeString()}] Command sent: ${cmd}\n`;
+      const outputDiv = document.getElementById('output');
+      outputDiv.textContent += logLine;
+      outputDiv.scrollTop = outputDiv.scrollHeight;
+    }
+  </script>
+</body>
+</html>
