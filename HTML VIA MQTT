@@ -38,6 +38,20 @@
       margin: 10px 0;
       font-weight: bold;
     }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid #ccc;
+      padding: 8px;
+      text-align: center;
+    }
+    th {
+      background: #f4f4f4;
+      font-weight: bold;
+    }
   </style>
 </head>
 <body>
@@ -46,9 +60,28 @@
   <div id="status">Connecting to broker...</div>
   <button class="btn" onclick="sendControl('ON')">Start Data</button>
   <button class="btn" onclick="sendControl('OFF')">Stop Data</button>
+  <button class="btn" onclick="downloadCSV()">Download CSV</button>
 
   <h2>Realtime Data Output</h2>
-  <div id="output"></div>
+  <div id="output">
+    <table id="dataTable">
+      <thead>
+        <tr>
+          <th>Timestamp</th>
+          <th>AX (m/s²)</th>
+          <th>AY (m/s²)</th>
+          <th>AZ (m/s²)</th>
+          <th>GX (raw)</th>
+          <th>GY (raw)</th>
+          <th>GZ (raw)</th>
+          <th>MX (uT)</th>
+          <th>MY (uT)</th>
+          <th>MZ (uT)</th>
+        </tr>
+      </thead>
+      <tbody id="dataBody"></tbody>
+    </table>
+  </div>
 
   <h2>Accelerometer (m/s²)</h2>
   <canvas id="accelChart" width="800" height="300"></canvas>
@@ -60,13 +93,19 @@
   <canvas id="magChart" width="800" height="300"></canvas>
 
   <script>
-    const brokerIP = 'ws://10.24.48.16:9001'; // sesuaikan IP broker di sini IPv4 Address. . . . . . . . . . . lokal
-    const client = mqtt.connect(brokerIP);
+    const brokerIP = 'ws://172.20.10.2:9001'; // Sesuaikan IP broker
+    const client = mqtt.connect(brokerIP, {
+      connectTimeout: 5000,
+      keepalive: 60
+    });
 
     const statusDiv = document.getElementById('status');
-
+    const outputDiv = document.getElementById('output');
+    const dataBody = document.getElementById('dataBody');
     const maxPoints = 20;
+    const maxRows = 10;
     const labels = [];
+    let csvData = []; // Array untuk menyimpan data CSV
 
     function createChart(ctx, label, colors) {
       return new Chart(ctx, {
@@ -112,48 +151,93 @@
     client.on('connect', () => {
       console.log("Connected to MQTT Broker");
       statusDiv.textContent = "🟢 Connected to MQTT Broker";
-      client.subscribe('sensor/data');
+      client.subscribe('sensor/data', (err) => {
+        if (!err) {
+          console.log("Subscribed to sensor/data");
+        } else {
+          console.error("Subscription error:", err);
+          statusDiv.textContent = "🔴 Subscription Error";
+        }
+      });
     });
 
     client.on('message', (topic, message) => {
-      const data = JSON.parse(message.toString());
-      const timeLabel = new Date().toLocaleTimeString();
+      console.log('Received topic:', topic);
+      console.log('Received message:', message.toString());
+      try {
+        const data = JSON.parse(message.toString());
+        console.log('Parsed data:', data);
+        const timeLabel = data.timestamp || new Date().toLocaleTimeString();
 
-      labels.push(timeLabel);
-      if (labels.length > maxPoints) labels.shift();
+        // Simpan data ke array CSV
+        csvData.push([
+          data.timestamp,
+          data.ax,
+          data.ay,
+          data.az,
+          data.gx,
+          data.gy,
+          data.gz,
+          data.mx,
+          data.my,
+          data.mz
+        ]);
 
-      // Accelerometer
-      accelChart.data.datasets[0].data.push(data.ax);
-      accelChart.data.datasets[1].data.push(data.ay);
-      accelChart.data.datasets[2].data.push(data.az);
-      if (accelChart.data.datasets[0].data.length > maxPoints) {
-        accelChart.data.datasets.forEach(ds => ds.data.shift());
+        labels.push(timeLabel);
+        if (labels.length > maxPoints) labels.shift();
+
+        // Accelerometer
+        accelChart.data.datasets[0].data.push(data.ax);
+        accelChart.data.datasets[1].data.push(data.ay);
+        accelChart.data.datasets[2].data.push(data.az);
+        if (accelChart.data.datasets[0].data.length > maxPoints) {
+          accelChart.data.datasets.forEach(ds => ds.data.shift());
+        }
+
+        // Gyroscope
+        gyroChart.data.datasets[0].data.push(data.gx);
+        gyroChart.data.datasets[1].data.push(data.gy);
+        gyroChart.data.datasets[2].data.push(data.gz);
+        if (gyroChart.data.datasets[0].data.length > maxPoints) {
+          gyroChart.data.datasets.forEach(ds => ds.data.shift());
+        }
+
+        // Magnetometer
+        magChart.data.datasets[0].data.push(data.mx);
+        magChart.data.datasets[1].data.push(data.my);
+        magChart.data.datasets[2].data.push(data.mz);
+        if (magChart.data.datasets[0].data.length > maxPoints) {
+          magChart.data.datasets.forEach(ds => ds.data.shift());
+        }
+
+        accelChart.update();
+        gyroChart.update();
+        magChart.update();
+
+        // Tambahkan data baru ke tabel di atas
+        const row = document.createElement('tr');
+        row.innerHTML = `
+          <td>${timeLabel}</td>
+          <td>${data.ax.toFixed(6)}</td>
+          <td>${data.ay.toFixed(6)}</td>
+          <td>${data.az.toFixed(6)}</td>
+          <td>${data.gx}</td>
+          <td>${data.gy}</td>
+          <td>${data.gz}</td>
+          <td>${data.mx}</td>
+          <td>${data.my}</td>
+          <td>${data.mz}</td>
+        `;
+        console.log('Adding row to table:', row.innerHTML);
+        dataBody.insertBefore(row, dataBody.firstChild);
+        if (dataBody.children.length > maxRows) {
+          dataBody.removeChild(dataBody.lastChild);
+        }
+        outputDiv.scrollTop = 0; // Pastikan tabel menampilkan data terbaru
+      } catch (e) {
+        console.error("JSON parse error:", e);
+        statusDiv.textContent = "🔴 JSON Parse Error";
       }
-
-      // Gyroscope
-      gyroChart.data.datasets[0].data.push(data.gx);
-      gyroChart.data.datasets[1].data.push(data.gy);
-      gyroChart.data.datasets[2].data.push(data.gz);
-      if (gyroChart.data.datasets[0].data.length > maxPoints) {
-        gyroChart.data.datasets.forEach(ds => ds.data.shift());
-      }
-
-      // Magnetometer
-      magChart.data.datasets[0].data.push(data.mx);
-      magChart.data.datasets[1].data.push(data.my);
-      magChart.data.datasets[2].data.push(data.mz);
-      if (magChart.data.datasets[0].data.length > maxPoints) {
-        magChart.data.datasets.forEach(ds => ds.data.shift());
-      }
-
-      accelChart.update();
-      gyroChart.update();
-      magChart.update();
-
-      const outputDiv = document.getElementById('output');
-      const logLine = `[${timeLabel}] ${JSON.stringify(data)}\n`;
-      outputDiv.textContent += logLine;
-      outputDiv.scrollTop = outputDiv.scrollHeight;
     });
 
     client.on('error', (err) => {
@@ -162,15 +246,39 @@
     });
 
     client.on('offline', () => {
+      console.log("MQTT Offline");
       statusDiv.textContent = "🔴 MQTT Offline, reconnecting...";
     });
 
     function sendControl(cmd) {
-      client.publish('sensor/control', cmd);
-      const logLine = `[${new Date().toLocaleTimeString()}] Command sent: ${cmd}\n`;
-      const outputDiv = document.getElementById('output');
-      outputDiv.textContent += logLine;
-      outputDiv.scrollTop = outputDiv.scrollHeight;
+      client.publish('sensor/control', cmd, (err) => {
+        if (!err) {
+          console.log("Sent command:", cmd);
+          const cmdRow = `<tr><td colspan="10">[${new Date().toLocaleTimeString()}] Command sent: ${cmd}</td></tr>`;
+          console.log('Adding command to table:', cmdRow);
+          dataBody.insertBefore(document.createRange().createContextualFragment(cmdRow), dataBody.firstChild);
+          if (dataBody.children.length > maxRows) {
+            dataBody.removeChild(dataBody.lastChild);
+          }
+          outputDiv.scrollTop = 0; // Pastikan tabel menampilkan data terbaru
+        } else {
+          console.error("Publish error:", err);
+        }
+      });
+    }
+
+    function downloadCSV() {
+      let csvContent = 'timestamp,ax,ay,az,gx,gy,gz,mx,my,mz\n';
+      csvData.forEach(row => {
+        csvContent += row.join(',') + '\n';
+      });
+      const blob = new Blob([csvContent], { type: 'text/csv' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `sensor_data_${new Date().toISOString().replace(/[:.]/g, '-')}.csv`;
+      a.click();
+      window.URL.revokeObjectURL(url);
     }
   </script>
 </body>
