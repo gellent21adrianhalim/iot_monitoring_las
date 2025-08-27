@@ -1,244 +1,476 @@
-#include <ESP8266WiFi.h>                      // Library untuk koneksi WiFi
-#include <WebSocketsServer.h>                // Library WebSocket Server (untuk browser)
-#include <WebSocketsClient.h>                // Library WebSocket Client (untuk Django)
-#include <ESP8266WebServer.h>                // Web server untuk melayani halaman HTML
-#include <Wire.h>                            // I2C communication
-#include <Adafruit_Sensor.h>                 // Base class untuk sensor Adafruit
-#include <Adafruit_ADXL345_U.h>              // Library untuk sensor ADXL345
-#include <Adafruit_HMC5883_U.h>              // Library untuk sensor HMC5883L
-#include <NTPClient.h>                       // Untuk sinkronisasi waktu via NTP
-#include <WiFiUdp.h>                         // UDP diperlukan oleh NTPClient
-#include <ArduinoJson.h>                     // Library JSON untuk kirim data sensor
+#include <ESP8266WiFi.h> // Mengimpor library untuk mengelola koneksi WiFi pada ESP8266
+#include <WebSocketsServer.h> // Mengimpor library untuk membuat server WebSocket
+#include <WebSocketsClient.h> // Mengimpor library untuk membuat klien WebSocket
+#include <ESP8266WebServer.h> // Mengimpor library untuk membuat server HTTP pada ESP8266
+#include <Wire.h> // Mengimpor library untuk komunikasi I2C
+#include <Adafruit_Sensor.h> // Mengimpor library dasar untuk sensor Adafruit
+#include <Adafruit_ADXL345_U.h> // Mengimpor library untuk sensor accelerometer ADXL345
+#include <QMC5883LCompass.h> // Mengimpor library untuk sensor magnetometer QMC5883L
+#include <NTPClient.h> // Mengimpor library untuk mengakses waktu dari server NTP
+#include <WiFiUdp.h> // Mengimpor library untuk komunikasi UDP yang digunakan oleh NTP
+#include <ArduinoJson.h> // Mengimpor library untuk mengelola data JSON
 
 // Konfigurasi WiFi
-const char* ssid = "@WIFI - USAKTI Out";      // Nama SSID WiFi
-const char* password = "";                   // Password WiFi
+const char* ssid = "anomali"; // Mendefinisikan nama jaringan WiFi (SSID)
+const char* password = "12121212"; // Mendefinisikan kata sandi WiFi
 
 // WebSocket client untuk koneksi ke Django
-WebSocketsClient wsClient;
-const char* ws_host = "10.24.48.19";          // IP server Django
-const uint16_t ws_port = 8000;                // Port WebSocket di server Django
-const char* ws_path = "/ws/data/";           // Endpoint WebSocket
+WebSocketsClient wsClient; // Membuat objek klien WebSocket untuk terhubung ke server Django
+const char* ws_host = "172.20.10.2"; // Mendefinisikan alamat IP server WebSocket (Django)
+const uint16_t ws_port = 8000; // Mendefinisikan port server WebSocket
+const char* ws_path = "/ws/data/"; // Mendefinisikan path untuk koneksi WebSocket
 
-// Web server & WebSocket server lokal (untuk browser)
-ESP8266WebServer server(80);                  // HTTP server port 80
-WebSocketsServer wsServer = WebSocketsServer(81); // WebSocket server port 81
+// Web server & WebSocket server lokal
+ESP8266WebServer server(80); // Membuat objek server HTTP pada port 80
+WebSocketsServer wsServer = WebSocketsServer(81); // Membuat objek server WebSocket lokal pada port 81
 
 // Inisialisasi NTP
-WiFiUDP ntpUDP;                               // Objek UDP
-NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600, 60000); // UTC+7, update setiap 60 detik
+WiFiUDP ntpUDP; // Membuat objek untuk komunikasi UDP untuk NTP
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600, 60000); // Membuat objek klien NTP untuk mendapatkan waktu dari server NTP, dengan offset zona waktu 7 jam dan pembaruan setiap 60 detik
 
 // Inisialisasi sensor
-Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345); // Sensor akselerometer
-Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(54321);   // Sensor magnetometer
-#define ITG3205_ADDR 0x68                     // Alamat I2C sensor gyro ITG3205
+Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345); // Membuat objek untuk sensor accelerometer ADXL345 dengan ID 12345
+QMC5883LCompass mag; // Membuat objek untuk sensor magnetometer QMC5883L
+#define ITG3205_ADDR 0x68 // Mendefinisikan alamat I2C untuk sensor gyroscope ITG-3205
+bool magDetected = false; // Variabel untuk menyimpan status deteksi sensor magnetometer
+bool accelDetected = false; // Variabel untuk menyimpan status deteksi sensor accelerometer
+bool gyroDetected = false; // Variabel untuk menyimpan status deteksi sensor gyroscope
 
-// Halaman web yang ditampilkan ke browser (HTML + Chart.js)
-const char htmlPage[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <title>Welding Monitoring Dashboard</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <style>
-    body { font-family: sans-serif; background: #f0f0f0; padding: 20px; text-align: center; }
-    canvas { background: #fff; border: 1px solid #ccc; margin-top: 10px; }
-    #output { background: #fff; border: 1px solid #ccc; margin: 20px 0; padding: 10px; text-align: left; max-height: 250px; overflow-y: auto; font-size: 14px; }
-  </style>
-</head>
-<body>
-  <h1>Realtime Welding Monitoring via WebSocket</h1>
-  <div id="output"></div>
-
-  <h2>Accelerometer (m/s²)</h2>
-  <canvas id="accelChart" width="800" height="300"></canvas>
-
-  <h2>Gyroscope (raw)</h2>
-  <canvas id="gyroChart" width="800" height="300"></canvas>
-
-  <h2>Magnetometer (uT)</h2>
-  <canvas id="magChart" width="800" height="300"></canvas>
-
-  <script>
-    let socket = new WebSocket(`ws://${location.hostname}:81`);  // Koneksi WebSocket ke ESP
-    const output = document.getElementById("output");
-    const maxPoints = 20;
-    const labels = [];
-
-    function createChart(ctx, label, colors) {
-      return new Chart(ctx, {
-        type: 'line',
-        data: {
-          labels: labels,
-          datasets: label.map((l, i) => ({
-            label: l,
-            borderColor: colors[i],
-            data: [],
-            fill: false,
+// Halaman web
+const char htmlPage[] PROGMEM = R"rawliteral( // Mendefinisikan halaman HTML sebagai string di memori program (PROGMEM)
+<!DOCTYPE html> // Deklarasi tipe dokumen HTML
+<html> // Membuka tag HTML
+<head> // Membuka tag kepala dokumen
+  <meta charset="UTF-8"> // Menetapkan encoding karakter UTF-8
+  <title>Welding Monitoring Dashboard</title> // Menetapkan judul halaman
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script> // Mengimpor library Chart.js dari CDN untuk visualisasi data
+  <style> // Membuka tag gaya CSS
+    body { font-family: sans-serif; background: #f0f0f0; padding: 20px; text-align: center; } // Menetapkan gaya untuk body: font, warna latar, padding, dan perataan teks
+    h2 { margin-top: 30px; color: #333; } // Menetapkan gaya untuk heading h2: margin atas dan warna teks
+    canvas { background: #fff; border: 1px solid #ccc; margin-top: 10px; } // Menetapkan gaya untuk elemen canvas: latar putih, border, dan margin atas
+    #output { background: #fff; border: 1px solid #ccc; margin: 20px 0; padding: 10px; text-align: left; max-height: 250px; overflow-y: auto; font-size: 14px; } // Menetapkan gaya untuk div output: latar, border, margin, padding, perataan teks, tinggi maksimum, dan scroll vertikal
+    table { width: 100%; border-collapse: collapse; font-size: 14px; } // Menetapkan gaya untuk tabel: lebar penuh, border collapse, dan ukuran font
+    th, td { border: 1px solid #ccc; padding: 8px; text-align: center; } // Menetapkan gaya untuk sel tabel: border, padding, dan perataan teks
+    th { background: #f4f4f4; font-weight: bold; } // Menetapkan gaya untuk header tabel: latar dan teks tebal
+  </style> // Menutup tag gaya CSS
+</head> // Menutup tag kepala
+<body> // Membuka tag body
+  <h1>Realtime Welding Monitoring via WebSocket</h1> // Menampilkan judul utama halaman
+  <h2>Realtime Data Output</h2> // Menampilkan subjudul untuk bagian output data
+  <div id="output"> // Membuka div untuk menampilkan tabel data
+    <table id="dataTable"> // Membuat tabel dengan ID dataTable
+      <thead> // Membuka bagian header tabel
+        <tr> // Membuka baris header tabel
+          <th>Timestamp</th> // Kolom header untuk waktu
+          <th>AX (m/s²)</th> // Kolom header untuk akselerasi sumbu X
+          <th>AY (m/s²)</th> // Kolom header untuk akselerasi sumbu Y
+          <th>AZ (m/s²)</th> // Kolom header untuk akselerasi sumbu Z
+          <th>GX (raw)</th> // Kolom header untuk data gyroscope sumbu X
+          <th>GY (raw)</th> // Kolom header untuk data gyroscope sumbu Y
+          <th>GZ (raw)</th> // Kolom header untuk data gyroscope sumbu Z
+          <th>MX (uT)</th> // Kolom header untuk data magnetometer sumbu X
+          <th>MY (uT)</th> // Kolom header untuk data magnetometer sumbu Y
+          <th>MZ (uT)</th> // Kolom header untuk data magnetometer sumbu Z
+        </tr> // Menutup baris header tabel
+      </thead> // Menutup bagian header tabel
+      <tbody id="dataBody"></tbody> // Membuat tubuh tabel dengan ID dataBody untuk menampilkan data secara dinamis
+    </table> // Menutup tabel
+  </div> // Menutup div output
+  <h2>Accelerometer (m/s²)</h2> // Subjudul untuk grafik accelerometer
+  <canvas id="accelChart" width="800" height="300"></canvas> // Membuat elemen canvas untuk grafik accelerometer
+  <h2>Gyroscope (raw)</h2> // Subjudul untuk grafik gyroscope
+  <canvas id="gyroChart" width="800" height="300"></canvas> // Membuat elemen canvas untuk grafik gyroscope
+  <h2>Magnetometer (uT)</h2> // Subjudul untuk grafik magnetometer
+  <canvas id="magChart" width="800" height="300"></canvas> // Membuat elemen canvas untuk grafik magnetometer
+  <script> // Membuka tag skrip JavaScript
+    let socket = new WebSocket(ws://${location.hostname}:81); // Membuat koneksi WebSocket ke server lokal pada port 81
+    const outputDiv = document.getElementById("output"); // Mendapatkan referensi ke div output
+    const dataBody = document.getElementById("dataBody"); // Mendapatkan referensi ke tubuh tabel
+    const maxPoints = 20; // Menetapkan jumlah maksimum titik data untuk grafik
+    const maxRows = 10; // Menetapkan jumlah maksimum baris untuk tabel
+    const labels = []; // Membuat array untuk menyimpan label waktu
+    socket.onopen = function() { // Menangani event saat koneksi WebSocket terbuka
+      console.log("Connected to WebSocket server at ws://" + location.hostname + ":81"); // Mencetak pesan ke konsol saat terhubung
+    };
+    socket.onclose = function() { // Menangani event saat koneksi WebSocket ditutup
+      console.log("Disconnected from WebSocket server"); // Mencetak pesan ke konsol saat terputus
+    };
+    socket.onerror = function(error) { // Menangani event saat terjadi error pada WebSocket
+      console.error("WebSocket error:", error); // Mencetak pesan error ke konsol
+    };
+    socket.onmessage = function(e) { // Menangani event saat menerima pesan dari WebSocket
+      console.log("Raw message received:", e.data); // Mencetak data mentah yang diterima ke konsol
+      try { // Memulai blok try untuk menangani kemungkinan error parsing JSON
+        const data = JSON.parse(e.data); // Parsing data JSON yang diterima
+        console.log("Parsed data:", data); // Mencetak data yang telah diparse ke konsol
+        console.log("Fields - ax:", data.ax, "ay:", data.ay, "az:", data.az, // Mencetak nilai-nilai field JSON ke konsol
+                    "gx:", data.gx, "gy:", data.gy, "gz:", data.gz,
+                    "mx:", data.mx, "my:", data.my, "mz:", data.mz,
+                    "timestamp:", data.timestamp);
+        if (data.ax === undefined || data.ay === undefined || data.az === undefined || // Memeriksa apakah data accelerometer tidak lengkap
+            data.gx === undefined || data.gy === undefined || data.gz === undefined || // Memeriksa apakah data gyroscope tidak lengkap
+            data.timestamp === undefined) { // Memeriksa apakah timestamp tidak ada
+          console.error("Incomplete JSON data:", data); // Mencetak error jika data JSON tidak lengkap
+          return; // Keluar dari fungsi jika data tidak lengkap
+        }
+        const timeLabel = data.timestamp || new Date().toLocaleTimeString(); // Menggunakan timestamp dari data atau waktu lokal jika tidak ada
+        labels.push(timeLabel); // Menambahkan timestamp ke array labels
+        if (labels.length > maxPoints) labels.shift(); // Menghapus label pertama jika jumlah label melebihi maxPoints
+        [accelChart, gyroChart, magChart].forEach(chart => { // Mengiterasi semua grafik (accelerometer, gyroscope, magnetometer)
+          chart.data.datasets.forEach(ds => { // Mengiterasi setiap dataset dalam grafik
+            if (ds.data.length >= maxPoints) ds.data.shift(); // Menghapus data pertama jika jumlah data melebihi maxPoints
+          });
+        });
+        accelChart.data.datasets[0].data.push(data.ax); // Menambahkan data ax ke dataset accelerometer
+        accelChart.data.datasets[1].data.push(data.ay); // Menambahkan data ay ke dataset accelerometer
+        accelChart.data.datasets[2].data.push(data.az); // Menambahkan data az ke dataset accelerometer
+        gyroChart.data.datasets[0].data.push(data.gx); // Menambahkan data gx ke dataset gyroscope
+        gyroChart.data.datasets[1].data.push(data.gy); // Menambahkan data gy ke dataset gyroscope
+        gyroChart.data.datasets[2].data.push(data.gz); // Menambahkan data gz ke dataset gyroscope
+        magChart.data.datasets[0].data.push(data.mx); // Menambahkan data mx ke dataset magnetometer
+        magChart.data.datasets[1].data.push(data.my); // Menambahkan data my ke dataset magnetometer
+        magChart.data.datasets[2].data.push(data.mz); // Menambahkan data mz ke dataset magnetometer
+        accelChart.update(); // Memperbarui grafik accelerometer
+        gyroChart.update(); // Memperbarui grafik gyroscope
+        magChart.update(); // Memperbarui grafik magnetometer
+        const row = document.createElement('tr'); // Membuat elemen baris tabel baru
+        row.innerHTML = ` // Mengisi baris tabel dengan data
+          <td>${timeLabel}</td> // Menambahkan timestamp ke kolom pertama
+          <td>${Number(data.ax).toFixed(6)}</td> // Menambahkan data ax dengan 6 desimal
+          <td>${Number(data.ay).toFixed(6)}</td> // Menambahkan data ay dengan 6 desimal
+          <td>${Number(data.az).toFixed(6)}</td> // Menambahkan data az dengan 6 desimal
+          <td>${data.gx}</td> // Menambahkan data gx
+          <td>${data.gy}</td> // Menambahkan data gy
+          <td>${data.gz}</td> // Menambahkan data gz
+          <td>${data.mx !== undefined ? data.mx : 'N/A'}</td> // Menambahkan data mx atau 'N/A' jika tidak ada
+          <td>${data.my !== undefined ? data.my : 'N/A'}</td> // Menambahkan data my atau 'N/A' jika tidak ada
+          <td>${data.mz !== undefined ? data.mz : 'N/A'}</td> // Menambahkan data mz atau 'N/A' jika tidak ada
+        `;
+        console.log('Adding row to table:', row.innerHTML); // Mencetak isi baris tabel ke konsol
+        dataBody.insertBefore(row, dataBody.firstChild); // Menambahkan baris baru di bagian atas tabel
+        if (dataBody.children.length > maxRows) { // Memeriksa apakah jumlah baris melebihi maxRows
+          dataBody.removeChild(dataBody.lastChild); // Menghapus baris terakhir jika melebihi maxRows
+        }
+        outputDiv.scrollTop = 0; // Mengatur scroll ke bagian atas div output
+      } catch (e) { // Menangkap error parsing JSON
+        console.error("JSON parse error:", e); // Mencetak pesan error ke konsol
+      }
+    };
+    function createChart(ctx, label, colors) { // Fungsi untuk membuat grafik menggunakan Chart.js
+      return new Chart(ctx, { // Mengembalikan objek grafik baru
+        type: 'line', // Menetapkan tipe grafik sebagai grafik garis
+        data: { // Mengatur data untuk grafik
+          labels: labels, // Menggunakan array labels untuk sumbu X
+          datasets: label.map((l, i) => ({ // Membuat dataset untuk setiap label
+            label: l, // Menetapkan label dataset
+            borderColor: colors[i], // Menetapkan warna garis
+            data: [], // Inisialisasi array data kosong
+            fill: false, // Menonaktifkan pengisian area di bawah garis
           }))
         },
-        options: {
-          responsive: true,
-          animation: false,
-          scales: {
-            x: { display: true },
-            y: { display: true }
+        options: { // Mengatur opsi grafik
+          responsive: true, // Membuat grafik responsif
+          animation: false, // Menonaktifkan animasi
+          scales: { // Mengatur sumbu grafik
+            x: { display: true }, // Menampilkan sumbu X
+            y: { display: true } // Menampilkan sumbu Y
           }
         }
       });
     }
-
-    const accelChart = createChart(
-      document.getElementById('accelChart').getContext('2d'),
-      ['ax', 'ay', 'az'],
-      ['red', 'green', 'blue']
+    const accelChart = createChart( // Membuat grafik untuk accelerometer
+      document.getElementById('accelChart').getContext('2d'), // Mendapatkan konteks 2D dari canvas accelerometer
+      ['ax', 'ay', 'az'], // Label untuk sumbu X, Y, Z
+      ['red', 'green', 'blue'] // Warna untuk setiap sumbu
     );
-
-    const gyroChart = createChart(
-      document.getElementById('gyroChart').getContext('2d'),
-      ['gx', 'gy', 'gz'],
-      ['orange', 'purple', 'brown']
+    const gyroChart = createChart( // Membuat grafik untuk gyroscope
+      document.getElementById('gyroChart').getContext('2d'), // Mendapatkan konteks 2D dari canvas gyroscope
+      ['gx', 'gy', 'gz'], // Label untuk sumbu X, Y, Z
+      ['orange', 'purple', 'brown'] // Warna untuk setiap sumbu
     );
-
-    const magChart = createChart(
-      document.getElementById('magChart').getContext('2d'),
-      ['mx', 'my', 'mz'],
-      ['teal', 'olive', 'maroon']
+    const magChart = createChart( // Membuat grafik untuk magnetometer
+      document.getElementById('magChart').getContext('2d'), // Mendapatkan konteks 2D dari canvas magnetometer
+      ['mx', 'my', 'mz'], // Label untuk sumbu X, Y, Z
+      ['teal', 'olive', 'maroon'] // Warna untuk setiap sumbu
     );
-
-    socket.onmessage = function(e) {
-      const data = JSON.parse(e.data);  // Terima dan parse JSON dari ESP
-      const timeLabel = new Date().toLocaleTimeString();
-
-      labels.push(timeLabel);
-      if (labels.length > maxPoints) labels.shift();
-
-      [accelChart, gyroChart, magChart].forEach(chart => {
-        chart.data.datasets.forEach(ds => {
-          if (ds.data.length >= maxPoints) ds.data.shift();
-        });
-      });
-
-      accelChart.data.datasets[0].data.push(data.ax);
-      accelChart.data.datasets[1].data.push(data.ay);
-      accelChart.data.datasets[2].data.push(data.az);
-
-      gyroChart.data.datasets[0].data.push(data.gx);
-      gyroChart.data.datasets[1].data.push(data.gy);
-      gyroChart.data.datasets[2].data.push(data.gz);
-
-      magChart.data.datasets[0].data.push(data.mx);
-      magChart.data.datasets[1].data.push(data.my);
-      magChart.data.datasets[2].data.push(data.mz);
-
-      accelChart.update();
-      gyroChart.update();
-      magChart.update();
-
-      const logLine = `[${timeLabel}] ${JSON.stringify(data)}\n`;
-      output.textContent += logLine;
-      output.scrollTop = output.scrollHeight;
-    };
-  </script>
-</body>
-</html>
-)rawliteral";
+  </script> // Menutup tag skrip JavaScript
+</body> // Menutup tag body
+</html> // Menutup tag HTML
+)rawliteral"; // Menutup string HTML
 
 // Fungsi untuk membaca data 16-bit dari ITG-3205
-int16_t readWord(uint8_t reg) {
-  Wire.beginTransmission(ITG3205_ADDR);
-  Wire.write(reg);
-  Wire.endTransmission(false);
-  if (Wire.requestFrom(ITG3205_ADDR, 2) == 2)
-    return Wire.read() << 8 | Wire.read();
-  return 0;
+int16_t readWord(uint8_t reg) { // Mendefinisikan fungsi untuk membaca data 16-bit dari register sensor ITG-3205
+  Wire.beginTransmission(ITG3205_ADDR); // Memulai transmisi I2C ke alamat ITG-3205
+  Wire.write(reg); // Menulis alamat register yang akan dibaca
+  Wire.endTransmission(false); // Mengakhiri transmisi tanpa melepaskan bus I2C
+  if (Wire.requestFrom(ITG3205_ADDR, 2) == 2) { // Meminta 2 byte data dari alamat ITG-3205
+    int16_t value = Wire.read() << 8 | Wire.read(); // Menggabungkan 2 byte menjadi nilai 16-bit
+    return value; // Mengembalikan nilai yang dibaca
+  }
+  Serial.println("Failed to read ITG3205 register!"); // Mencetak pesan error jika gagal membaca
+  return 0; // Mengembalikan 0 jika gagal
 }
 
-void setup() {
-  Serial.begin(115200);                   // Mulai serial monitor
-  Wire.begin(4, 5);                       // Inisialisasi I2C SDA=D2 (GPIO4), SCL=D1 (GPIO5)
-
-  WiFi.begin(ssid, password);            // Hubungkan ke WiFi
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500); Serial.print(".");       // Tampilkan progress koneksi
+// Fungsi untuk memeriksa QMC5883L
+bool checkQMC5883L() { // Mendefinisikan fungsi untuk memeriksa keberadaan sensor QMC5883L
+  Wire.beginTransmission(0x0D); // Memulai transmisi I2C ke alamat QMC5883L (0x0D)
+  Wire.write(0x0D); // Menulis ke register ID perangkat
+  if (Wire.endTransmission(false) == 0 && Wire.requestFrom(0x0D, 1) == 1) { // Memeriksa apakah transmisi berhasil dan meminta 1 byte
+    uint8_t id = Wire.read(); // Membaca ID perangkat
+    Serial.print("QMC5883L Device ID: 0x"); // Mencetak ID perangkat ke Serial Monitor
+    Serial.println(id, HEX); // Mencetak ID dalam format heksadesimal
+    return id == 0xFF; // Mengembalikan true jika ID adalah 0xFF (ID QMC5883L)
   }
+  Serial.println("No response from QMC5883L at address 0x0D!"); // Mencetak pesan jika tidak ada respons
+  return false; // Mengembalikan false jika gagal mendeteksi
+}
 
-  Serial.println();
-  Serial.print("✅ WiFi connected! Access dashboard at: http://");
-  Serial.println(WiFi.localIP());        // Tampilkan IP lokal
+void setup() { // Fungsi setup yang dijalankan sekali saat mikrokontroler mulai
+  Serial.begin(115200); // Memulai komunikasi serial dengan baud rate 115200
+  Wire Spectrum(4, 5); // Menginisialisasi I2C dengan SDA di GPIO4 dan SCL di GPIO5
+  Wire.setClock(400000); // Mengatur kecepatan I2C ke 400 kHz
+  delay(100); // Menunda 100 ms untuk memastikan inisialisasi selesai
 
-  timeClient.begin();                    // Mulai sinkronisasi waktu
-  timeClient.forceUpdate();              // Ambil waktu awal langsung
+  Serial.println("Connecting to WiFi..."); // Mencetak pesan bahwa sedang menghubungkan ke WiFi
+  WiFi.begin(ssid, password); // Memulai koneksi WiFi dengan SSID dan kata sandi
+  while (WiFi.status() != WL_CONNECTED) { // Menunggu hingga WiFi terhubung
+    delay(500); // Menunda 500 ms setiap iterasi
+    Serial.print("."); // Mencetak titik untuk menunjukkan proses sedang berlangsung
+  }
+  Serial.println(); // Mencetak baris kosong
+  Serial.print("WiFi connected! Access dashboard at: http://"); // Mencetak pesan bahwa WiFi terhubung
+  Serial.println(WiFi.localIP()); // Mencetak alamat IP lokal perangkat
 
-  wsClient.begin(ws_host, ws_port, ws_path); // Koneksi WebSocket ke Django
-  wsClient.onEvent([](WStype_t type, uint8_t* payload, size_t len) {
-    if (type == WStype_CONNECTED) Serial.println("[WebSocket] Connected to Django");
-    if (type == WStype_DISCONNECTED) Serial.println("[WebSocket] Disconnected from Django");
+  Serial.println("Starting NTP client..."); // Mencetak pesan bahwa klien NTP dimulai
+  timeClient.begin(); // Memulai klien NTP
+  timeClient.forceUpdate(); // Memaksa pembaruan waktu dari server NTP
+  Serial.println("✅ NTP client started!"); // Mencetak pesan bahwa klien NTP berhasil dimulai
+
+  Serial.println("Starting WebSocket client to Django..."); // Mencetak pesan bahwa klien WebSocket ke Django dimulai
+  wsClient.begin(ws_host, ws_port, ws_path); // Memulai klien WebSocket untuk terhubung ke server Django
+  wsClient.onEvent([](WStype_t type, uint8_t* payload, size_t len) { // Menangani event WebSocket
+    if (type == WStype_CONNECTED) Serial.println("[WebSocket] Connected to Django"); // Mencetak pesan saat terhubung ke Django
+    if (type == WStype_DISCONNECTED) Serial.println("[WebSocket] Disconnected from Django"); // Mencetak pesan saat terputus dari Django
   });
 
-  wsServer.begin();                      // Mulai WebSocket server lokal (browser)
-
-  server.on("/", HTTP_GET, []() {         // Saat ada akses ke root URL
-    server.send_P(200, "text/html", htmlPage); // Kirim halaman HTML
+  Serial.println("Starting WebSocket server..."); // Mencetak pesan bahwa server WebSocket lokal dimulai
+  wsServer.onEvent([](uint8_t num, WStype_t type, uint8_t *payload, size_t length) { // Menangani event untuk server WebSocket lokal
+    switch (type) { // Memeriksa jenis event
+      case WStype_CONNECTED: // Jika klien terhubung
+        Serial.printf("WebSocket client #%u connected\n", num); // Mencetak pesan bahwa klien terhubung
+        break; // Keluar dari switch
+      case WStype_DISCONNECTED: // Jika klien terputus
+        Serial.printf("WebSocket client #%u disconnected\n", num); // Mencetak pesan bahwa klien terputus
+        break; // Keluar dari switch
+      case WStype_TEXT: // Jika menerima data teks
+        Serial.printf("Received text from client #%u: %s\n", num, payload); // Mencetak data yang diterima
+        break; // Keluar dari switch
+      case WStype_ERROR: // Jika terjadi error
+        Serial.printf("WebSocket error for client #%u\n", num); // Mencetak pesan error
+        break; // Keluar dari switch
+    }
   });
-  server.begin();                        // Mulai HTTP server
+  wsServer.begin(); // Memulai server WebSocket lokal
+  Serial.println("✅ WebSocket server started!"); // Mencetak pesan bahwa server WebSocket berhasil dimulai
 
-  if (!accel.begin() || !mag.begin()) {  // Cek sensor
-    Serial.println("Sensor not detected");
-    while (1);
+  Serial.println("Starting HTTP server..."); // Mencetak pesan bahwa server HTTP dimulai
+  server.on("/", HTTP_GET, []() { // Menangani permintaan GET ke root ("/")
+    Serial.println("Serving root page, redirecting to /dashboard"); // Mencetak pesan bahwa halaman root diakses
+    server.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='0;url=/dashboard'></head></html>"); // Mengirim respons untuk redirect ke /dashboard
+  });
+  server.on("/dashboard", HTTP_GET, []() { // Menangani permintaan GET ke "/dashboard"
+    Serial.println("Serving dashboard page"); // Mencetak pesan bahwa halaman dashboard diakses
+    server.send_P(200, "text/html", htmlPage); // Mengirim halaman HTML dari memori program
+  });
+  server.begin(); // Memulai server HTTP
+  Serial.println("✅ HTTP server started!"); // Mencetak pesan bahwa server HTTP berhasil dimulai
+
+  Serial.println("Initializing ADXL345..."); // Mencetak pesan bahwa inisialisasi ADXL345 dimulai
+  if (!accel.begin()) { // Mencoba menginisialisasi sensor ADXL345
+    Serial.println("❌ ADXL345 not detected! Continuing..."); // Mencetak pesan jika sensor tidak terdeteksi
+    accelDetected = false; // Menandai bahwa accelerometer tidak terdeteksi
+  } else {
+    Serial.println("✅ ADXL345 detected!"); // Mencetak pesan bahwa sensor terdeteksi
+    accel.setRange(ADXL345_RANGE_16_G); // Mengatur rentang pengukuran accelerometer ke ±16g
+    accelDetected = true; // Menandai bahwa accelerometer terdeteksi
   }
 
-  Wire.beginTransmission(ITG3205_ADDR);  // Aktifkan ITG-3205 dari sleep
-  Wire.write(0x3E);
-  Wire.write(0x00);
-  Wire.endTransmission();
-}
-
-void loop() {
-  wsClient.loop();                       // Loop untuk WebSocket client
-  wsServer.loop();                       // Loop untuk WebSocket server
-  server.handleClient();                 // Handle permintaan HTTP
-
-  static unsigned long lastSend = 0;
-  if (millis() - lastSend > 500) {       // Kirim data setiap 500ms
-    lastSend = millis();
-    timeClient.update();
-    unsigned long epochTime = timeClient.getEpochTime();
-
-    sensors_event_t a, m;
-    accel.getEvent(&a);                  // Baca akselerometer
-    mag.getEvent(&m);                    // Baca magnetometer
-
-    int16_t gx = readWord(0x1D);         // Baca data gyro X
-    int16_t gy = readWord(0x1F);         // Baca data gyro Y
-    int16_t gz = readWord(0x21);         // Baca data gyro Z
-
-    char timeStamp[30];
-    time_t rawTime = epochTime;
-    struct tm timeinfo;
-    localtime_r(&rawTime, &timeinfo);    // Konversi ke waktu lokal
-    sprintf(timeStamp, "%04d-%02d-%02dT%02d:%02d:%02d",
-      timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-      timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-
-    StaticJsonDocument<512> doc;         // Buat objek JSON
-    doc["ax"] = a.acceleration.x;
-    doc["ay"] = a.acceleration.y;
-    doc["az"] = a.acceleration.z;
-    doc["gx"] = gx;
-    doc["gy"] = gy;
-    doc["gz"] = gz;
-    doc["mx"] = m.magnetic.x;
-    doc["my"] = m.magnetic.y;
-    doc["mz"] = m.magnetic.z;
-    doc["timestamp"] = timeStamp;
-
-    String payload;
-    serializeJson(doc, payload);         // Ubah JSON jadi string
-
-    wsClient.sendTXT(payload);           // Kirim ke Django
-    wsServer.broadcastTXT(payload);      // Kirim ke browser
-    Serial.println(payload);             // Tampilkan ke Serial Monitor
+  Serial.println("Initializing QMC5883L..."); // Mencetak pesan bahwa inisialisasi QMC5883L dimulai
+  mag.init(); // Menginisialisasi sensor magnetometer QMC5883L
+  delay(50); // Menunda 50 ms untuk memastikan inisialisasi selesai
+  if (checkQMC5883L()) { // Memeriksa keberadaan sensor QMC5883L
+    Serial.println("✅ QMC5883L detected!"); // Mencetak pesan bahwa sensor terdeteksi
+    magDetected = true; // Menandai bahwa magnetometer terdeteksi
+    // Atur konfigurasi QMC5883L
+    Wire.beginTransmission(0x0D); // Memulai transmisi I2C ke QMC5883L
+    Wire.write(0x09); // Menulis ke register kontrol 1
+    Wire.write(0x1D); // Mengatur mode continuous, output data rate 200Hz, rentang ±8G, OSR 512
+    Wire.endTransmission(); // Mengakhiri transmisi I2C
+  } else {
+    Serial.println("❌ QMC5883L not detected! Continuing with other sensors..."); // Mencetak pesan jika sensor tidak terdeteksi
+    magDetected = false; // Menandai bahwa magnetometer tidak terdeteksi
   }
+
+  Serial.println("Initializing ITG3205..."); // Mencetak pesan bahwa inisialisasi ITG3205 dimulai
+  Wire.beginTransmission(ITG3205_ADDR); // Mem開始 transmisi I2C ke ITG-3205
+  Wire.write(0	backspace;3E); // Menulis ke register power management
+  Wire.write(0x00); // Mengatur ke mode normal
+  if (Wire.endTransmission() != 0) { // Memeriksa apakah transmisi berhasil
+    Serial.println("❌ ITG3205 not detected! Continuing..."); // Mencetak pesan jika sensor tidak terdeteksi
+    gyroDetected = false; // Menandai bahwa gyroscope tidak terdeteksi
+  } else {
+    Serial.println("✅ ITG3205 detected!"); // Mencetak pesan bahwa sensor terdeteksi
+    gyroDetected = true; // Menandai bahwa gyroscope terdeteksi
+  }
+
+  // Cetak header tabel di Serial Monitor
+  Serial.println("timestamp:ax:ay:az:gx:gy:gz:mx:my:mz"); // Mencetak header untuk data sensor di Serial Monitor
 }
+
+void loop() { // Fungsi loop yang dijalankan berulang-ulang
+  wsClient.loop(); // Menangani operasi klien WebSocket
+  wsServer.loop(); // Menangani operasi server WebSocket lokal
+  server.handleClient(); // Menangani permintaan klien HTTP
+
+  static unsigned long lastPrint = 0; // Variabel statis untuk menyimpan waktu terakhir pencetakan data
+  static unsigned long lastSend = 0; // Variabel statis untuk menyimpan waktu terakhir pengiriman data
+  static unsigned long lastNtpUpdate = 0; // Variabel statis untuk menyimpan waktu terakhir pembaruan NTP
+
+  // Perbarui waktu NTP setiap 60 detik untuk mengurangi latensi
+  if (millis() - lastNtpUpdate >= 60000) { // Memeriksa apakah sudah 60 detik sejak pembaruan NTP terakhir
+    timeClient.update(); // Memperbarui waktu dari server NTP
+    lastNtpUpdate = millis(); // Memperbarui waktu terakhir pembaruan NTP
+  }
+
+  // Cetak data sensor ke Serial Monitor setiap 400 ms
+  if (millis() - lastPrint >= 400) { // Memeriksa apakah sudah 400 ms sejak pencetakan terakhir
+    lastPrint = millis(); // Memperbarui waktu terakhir pencetakan
+    unsigned long epochTime = timeClient.getEpochTime(); // Mendapatkan waktu epoch dari klien NTP
+
+    float ax = 0, ay = 0, az = 0; // Inisialisasi variabel untuk data accelerometer
+    if (accelDetected) { // Jika accelerometer terdeteksi
+      sensors_event_t a; // Membuat objek untuk menyimpan data event accelerometer
+      accel.getEvent(&a); // Membaca data dari accelerometer
+      ax = a.acceleration.x; // Menyimpan nilai akselerasi sumbu X
+      ay = a.acceleration.y; // Menyimpan nilai akselerasi sumbu Y
+      az = a.acceleration.z; // Menyimpan nilai akselerasi sumbu Z
+    }
+
+    int mx = 0, my = 0, mz = 0; // Inisialisasi variabel untuk data magnetometer
+    if (magDetected) { // Jika magnetometer terdeteksi
+      mag.read(); // Membaca data dari magnetometer
+      mx = mag.getX(); // Menyimpan nilai magnetometer sumbu X
+      my = mag.getY(); // Menyimpan nilai magnetometer sumbu Y
+      mz = mag.getZ(); // Menyimpan nilai magnetometer sumbu Z
+      if (mx == 0 && my == 0 && mz == 0) { // Memeriksa apakah data magnetometer tidak valid
+        Serial.println("Magnetometer data invalid (all zeros), possible I2C issue!"); // Mencetak pesan error jika data tidak valid
+      }
+    }
+
+    int16_t gx = 0, gy = 0, gz = 0; // Inisialisasi variabel untuk data gyroscope
+    if (gyroDetected) { // Jika gyroscope terdeteksi
+      gx = readWord(0x1D); // Membaca data gyroscope sumbu X
+      gy = readWord(0x1F); // Membaca data gyroscope sumbu Y
+      gz = readWord(0x21); // Membaca data gyroscope sumbu Z
+    }
+
+    char timeStamp[30]; // Membuat array untuk menyimpan string timestamp
+    time_t rawTime = epochTime; // Mengonversi waktu epoch ke tipe time_t
+    struct tm timeinfo; // Membuat struktur untuk menyimpan informasi waktu
+    localtime_r(&rawTime, &timeinfo); // Mengonversi waktu epoch ke waktu lokal
+    sprintf(timeStamp, "%04d-%02d-%02dT%02d:%02d:%02d", // Memformat timestamp ke format ISO
+            timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+            timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+
+    // Cetak data sensor ke Serial Monitor dengan format yang diinginkan
+    char output[256]; // Membuat array untuk menyimpan string output
+    snprintf(output, sizeof(output), "timestamp:%s ax:%.6f ay:%.6f az:%.6f gx:%d gy:%d gz:%d mx:%d my:%d mz:%d", // Memformat data sensor
+             timeStamp, ax, ay, az, gx, gy, gz, mx, my, mz);
+    Serial.println(output); // Mencetak data sensor ke Serial Monitor
+  }
+
+  // Kirim data melalui WebSocket setiap 1000 ms
+  if (millis() - lastSend >= 1000) { // Memeriksa apakah sudah 1000 ms sejak pengiriman terakhir
+    lastSend = millis(); // Memperbarui waktu terakhir pengiriman
+    unsigned long epochTime = timeClient.getEpochTime(); // Mendapatkan waktu epoch dari klien NTP
+
+    float ax = 0, ay = 0, az = 0; // Inisialisasi variabel untuk data accelerometer
+    if (accelDetected) { // Jika accelerometer terdeteksi
+      sensors_event_t a; // Membuat objek untuk menyimpan data event accelerometer
+      accel.getEvent(&a); // Membaca data dari accelerometer
+      ax = a.acceleration.x; // Menyimpan nilai akselerasi sumbu X
+      ay = a.acceleration.y; // Menyimpan nilai akselerasi sumbu Y
+      az = a.acceleration.z; // Menyimpan nilai akselerasi sumbu Z
+    } else {
+      // Gunakan data dummy jika sensor tidak terdeteksi untuk testing tampilan di browser
+      ax = random(0, 10) + random(0, 1000)/1000.0; // Menghasilkan data dummy untuk ax
+      ay = random(0, 10) + random(0, 1000)/1000.0; // Menghasilkan data dummy untuk ay
+      az = random(-5, 5) + random(0, 1000)/1000.0; // Menghasilkan data dummy untuk az
+    }
+
+    int mx = 0, my = 0, mz = 0; // Inisialisasi variabel untuk data magnetometer
+    if (magDetected) { // Jika magnetometer terdeteksi
+      mag.read(); // Membaca data dari magnetometer
+      mx = mag.getX(); // Menyimpan nilai magnetometer sumbu X
+      my = mag.getY(); // Menyimpan nilai magnetometer sumbu Y
+      mz = mag.getZ(); // Menyimpan nilai magnetometer sumbu Z
+      if (mx == 0 && my == 0 && mz == 0) { // Memeriksa apakah data magnetometer tidak valid
+        Serial.println("Magnetometer data invalid (all zeros), possible I2C issue!"); // Mencetak pesan error jika data tidak valid
+      }
+    } else {
+      // Dummy data untuk magnetometer
+      mx = random(500, 700); // Menghasilkan data dummy untuk mx
+      my = random(900, 1100); // Menghasilkan data dummy untuk my
+      mz = random(-2400, -2200); // Menghasilkan data dummy untuk mz
+    }
+
+    int16_t gx = 0, gy = 0, gz = 0; // Inisialisasi variabel untuk data gyroscope
+    if (gyroDetected) { // Jika gyroscope terdeteksi
+      gx = readWord(0x1D); // Membaca data gyroscope sumbu X
+      gy = readWord(0x1F); // Membaca data gyroscope sumbu Y
+      gz = readWord(0x21); // Membaca data gyroscope sumbu Z
+    } else {
+      // Dummy data untuk gyroscope
+      gx = random(-500, 0); // Menghasilkan data dummy untuk gx
+      gy = random(400, 600); // Menghasilkan data dummy untuk gy
+      gz = random(100, 200); // Menghasilkan data dummy untuk gz
+    }
+
+    char timeStamp[30]; // Membuat array untuk menyimpan string timestamp
+    time_t rawTime = epochTime; // Mengonversi waktu epoch ke tipe time_t
+    struct tm timeinfo; // Membuat struktur untuk menyimpan informasi waktu
+    localtime_r(&rawTime, &timeinfo); // Mengonversi waktu epoch ke waktu lokal
+    sprintf(timeStamp, "%04d-%02d-%02dT%02d:%02d:%02d", // Memformat timestamp ke format ISO
+            timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+            timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+
+    StaticJsonDocument<512> doc; // Membuat dokumen JSON dengan kapasitas 512 byte
+    doc["ax"] = ax; // Menambahkan data ax ke JSON
+    doc["ay"] = ay; // Menambahkan data ay ke JSON
+    doc["az"] = az; // Menambahkan data az ke JSON
+    doc["gx"] = gx; // Menambahkan data gx ke JSON
+    doc["gy"] = gy; // Menambahkan data gy ke JSON
+    doc["gz"] = gz; // Menambahkan data gz ke JSON
+    doc["mx"] = mx; // Menambahkan data mx ke JSON
+    doc["my"] = my; // Menambahkan data my ke JSON
+    doc["mz"] = mz; // Menambahkan data mz ke JSON
+    doc["timestamp"] = timeStamp; // Menambahkan timestamp ke JSON
+
+    String payload; // Membuat variabel untuk menyimpan payload JSON
+    serializeJson(doc, payload); // Mengonversi dokumen JSON ke string
+
+    // Debug print untuk konfirmasi pengiriman
+    Serial.print("Payload size: "); // Mencetak ukuran payload
+    Serial.println(payload.length()); // Mencetak panjang payload
+    Serial.print("Broadcasting to browser: "); // Mencetak pesan bahwa data akan dikirim ke browser
+    Serial.println(payload); // Mencetak payload ke Serial Monitor
+
+    // Kirim ke WebSocket Django jika terhubung
+    if (wsClient.isConnected()) { // Memeriksa apakah klien WebSocket terhubung
+      wsClient.sendTXT(payload); // Mengirim payload ke server Django
+    }
+
+    // Selalu kirim ke browser melalui WebSocket lokal
+    wsServer.broadcastTXT(payload); // Mengirim payload ke semua klien WebSocket lokal
+  }
+} // Menutup fungsi loop
